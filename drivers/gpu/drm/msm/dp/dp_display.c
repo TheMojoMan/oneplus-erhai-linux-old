@@ -33,91 +33,65 @@ module_param(psr_enabled, bool, 0);
 MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
 
 /*
- * erhai: expose the internal panel's native 3392x2400 size on the external DP
- * output, so a stock compositor has a mode common with DSI-1 and can mirror
- * without any userspace patch.  The mode is not in the sink EDID; the monitor
- * is expected to scale it to its own panel (30 Hz keeps the DP/HDMI pixel
- * clock low enough for the 2-lane USB-C alt-mode links).
+ * erhai: virtual mode for mirroring the internal panel.
+ *
+ * A mirrored logical monitor needs one mode size both outputs have, and the
+ * internal XN242 is a fixed 3392x2400 panel.  Advertising that size on the DP
+ * connector lets stock mutter + gnome-control-center mirror at the panel's
+ * native size: DSI-1 keeps running its real 3392x2400 timing unchanged (no
+ * modeset, no scaling on the tablet), while this mode is never sent to the
+ * sink - msm_dp_bridge_atomic_check() replaces it with the sink's own
+ * preferred EDID mode (2560x1080@60 on the LG 34") and the DPU scales the
+ * 3392x2400 framebuffer down to it.
+ *
+ * Sending a real 3392x2400 timing instead is not an option: it is outside the
+ * EDID range limits of ordinary monitors (the LG: 56-75 Hz, 240 MHz max pixel
+ * clock) and the sink overlays its "out of specification" OSD on the picture.
+ *
+ * DRM_MODE_TYPE_USERDEF marks the mode; it is the only spare bit in
+ * drm_display_mode.type that drm_mode_validate_basic() accepts, and
+ * compositors ignore it.
  */
-static const struct drm_display_mode erhai_dp_3392x2400_30 = {
-	.clock = 267168,
+#define ERHAI_DP_MODE_TYPE_VIRTUAL	DRM_MODE_TYPE_USERDEF
+
+static const struct drm_display_mode erhai_dp_3392x2400_virtual = {
+	.clock = 1175048,
 	.hdisplay = 3392,
-	.hsync_start = 3392 + 128,
-	.hsync_end = 3392 + 128 + 32,
-	.htotal = 3392 + 128 + 32 + 128,
+	.hsync_start = 3392 + 100,
+	.hsync_end = 3392 + 100 + 64,
+	.htotal = 3684,
 	.vdisplay = 2400,
-	.vsync_start = 2400 + 8,
-	.vsync_end = 2400 + 8 + 4,
-	.vtotal = 2400 + 8 + 4 + 8,
-	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-	.type = DRM_MODE_TYPE_DRIVER,
+	.vsync_start = 2400 + 26,
+	.vsync_end = 2400 + 26 + 2,
+	.vtotal = 2658,
+	.type = DRM_MODE_TYPE_DRIVER | ERHAI_DP_MODE_TYPE_VIRTUAL,
 };
 
-/* Fallbacks with the same size when the 2-lane alt-mode cannot carry 30 Hz. */
-static const struct drm_display_mode erhai_dp_3392x2400_24 = {
-	.clock = 213734,
-	.hdisplay = 3392,
-	.hsync_start = 3392 + 128,
-	.hsync_end = 3392 + 128 + 32,
-	.htotal = 3680,
-	.vdisplay = 2400,
-	.vsync_start = 2408,
-	.vsync_end = 2412,
-	.vtotal = 2420,
-	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-	.type = DRM_MODE_TYPE_DRIVER,
-};
-
-static const struct drm_display_mode erhai_dp_3392x2400_20 = {
-	.clock = 178112,
-	.hdisplay = 3392,
-	.hsync_start = 3392 + 128,
-	.hsync_end = 3392 + 128 + 32,
-	.htotal = 3680,
-	.vdisplay = 2400,
-	.vsync_start = 2408,
-	.vsync_end = 2412,
-	.vtotal = 2420,
-	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-	.type = DRM_MODE_TYPE_DRIVER,
-};
-
-/*
- * Default off: a sink whose EDID declares a range limit rejects this timing.
- * The LG 34" (EDID range 56-75 Hz, max pixel clock 240 MHz) scans it out but
- * shows its "Out of specification" OSD over the picture, so this route is only
- * a debug fallback now.  Mirroring without userspace patches is done with the
- * virtual scaled modes of the internal panel instead
- * (panel-oneplus-xn242.c + dsi_manager.c + dpu_plane.c).
- */
-static bool erhai_dp_add_native_mode;
+static bool erhai_dp_add_native_mode = true;
 module_param_named(add_native_panel_mode, erhai_dp_add_native_mode, bool, 0644);
 MODULE_PARM_DESC(add_native_panel_mode,
-		 "add the internal 3392x2400 mode to external DP outputs so mirroring can use the monitor's scaler (debug, usually out of the sink's EDID range)");
+		 "advertise the internal panel's 3392x2400 size on external DP outputs so a mirror can run at the panel's native size (the sink gets its own EDID mode, scaled by the DPU)");
+
+bool msm_dp_mode_is_virtual(const struct drm_display_mode *mode)
+{
+	return !!(mode->type & ERHAI_DP_MODE_TYPE_VIRTUAL);
+}
 
 static int msm_dp_add_native_panel_mode(struct drm_connector *connector)
 {
-	static const struct drm_display_mode * const modes[] = {
-		&erhai_dp_3392x2400_30,
-		&erhai_dp_3392x2400_24,
-		&erhai_dp_3392x2400_20,
-	};
-	unsigned int i;
-	int count = 0;
+	struct drm_display_mode *mode;
 
-	for (i = 0; i < ARRAY_SIZE(modes); i++) {
-		struct drm_display_mode *mode;
+	if (!erhai_dp_add_native_mode)
+		return 0;
 
-		mode = drm_mode_duplicate(connector->dev, modes[i]);
-		if (!mode)
-			continue;
+	mode = drm_mode_duplicate(connector->dev, &erhai_dp_3392x2400_virtual);
+	if (!mode)
+		return 0;
 
-		drm_mode_set_name(mode);
-		drm_mode_probed_add(connector, mode);
-		count++;
-	}
+	drm_mode_set_name(mode);
+	drm_mode_probed_add(connector, mode);
 
-	return count;
+	return 1;
 }
 
 /*
@@ -875,6 +849,15 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 		DRM_ERROR("invalid params\n");
 		return -EINVAL;
 	}
+
+	/*
+	 * A virtual mode (see erhai_dp_3392x2400_virtual below) never reaches
+	 * this link: msm_dp_bridge_atomic_check() swaps in the sink's own
+	 * preferred mode before the link is configured, so the pixel clock and
+	 * EDID range checks of the virtual size would wrongly reject it.
+	 */
+	if (msm_dp_mode_is_virtual(mode))
+		return MODE_OK;
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
 	link_info = &msm_dp_display->panel->link_info;

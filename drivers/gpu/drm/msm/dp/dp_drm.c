@@ -95,6 +95,59 @@ static enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *drm_brid
 	return msm_dp_display_mode_valid(dp, info, mode);
 }
 
+static const struct drm_display_mode *
+msm_dp_get_sink_mode(struct drm_connector *connector)
+{
+	struct drm_display_mode *mode;
+
+	if (!connector)
+		return NULL;
+
+	list_for_each_entry(mode, &connector->modes, head)
+		if (mode->type & DRM_MODE_TYPE_PREFERRED)
+			return mode;
+
+	return NULL;
+}
+
+/*
+ * erhai: see the erhai_dp_3392x2400_virtual comment in dp_display.c.
+ *
+ * The virtual 3392x2400 mode exists so a mirrored logical monitor can use the
+ * internal panel's native size.  It is never sent to the sink: swap it for the
+ * sink's own preferred EDID mode here, before the link is configured and
+ * before the DPU is set up.  Everything downstream (link training, DPU INTF,
+ * mixer) then uses the sink mode, and dpu_plane.c scales the 3392x2400
+ * framebuffer down to it.
+ */
+static int msm_dp_bridge_atomic_check(struct drm_bridge *drm_bridge,
+				      struct drm_bridge_state *bridge_state,
+				      struct drm_crtc_state *crtc_state,
+				      struct drm_connector_state *conn_state)
+{
+	const struct drm_display_mode *sink_mode;
+
+	if (!crtc_state->enable ||
+	    !msm_dp_mode_is_virtual(&crtc_state->mode))
+		return 0;
+
+	sink_mode = msm_dp_get_sink_mode(conn_state->connector);
+	if (!sink_mode) {
+		DRM_ERROR("virtual panel mode on a connector without a sink mode\n");
+		return -EINVAL;
+	}
+
+	DRM_DEBUG("erhai: virtual DP mode %dx%d@%d, sending %dx%d@%d\n",
+		  crtc_state->mode.hdisplay, crtc_state->mode.vdisplay,
+		  drm_mode_vrefresh(&crtc_state->mode),
+		  sink_mode->hdisplay, sink_mode->vdisplay,
+		  drm_mode_vrefresh(sink_mode));
+
+	drm_mode_copy(&crtc_state->adjusted_mode, sink_mode);
+
+	return 0;
+}
+
 static const struct drm_bridge_funcs msm_dp_bridge_ops = {
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state   = drm_atomic_helper_bridge_destroy_state,
@@ -103,6 +156,7 @@ static const struct drm_bridge_funcs msm_dp_bridge_ops = {
 	.atomic_enable          = msm_dp_bridge_atomic_enable,
 	.atomic_disable         = msm_dp_bridge_atomic_disable,
 	.atomic_post_disable    = msm_dp_bridge_atomic_post_disable,
+	.atomic_check = msm_dp_bridge_atomic_check,
 	.mode_valid   = msm_dp_bridge_mode_valid,
 	.get_modes    = msm_dp_bridge_get_modes,
 	.detect       = msm_dp_bridge_detect,

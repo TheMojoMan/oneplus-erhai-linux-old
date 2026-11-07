@@ -824,6 +824,96 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
 #define MAX_UPSCALE_RATIO	20
 #define MAX_DOWNSCALE_RATIO	4
 
+/*
+ * erhai: virtual scaled panel modes.
+ *
+ * The internal panel advertises desktop sizes it cannot scan out (the DSI
+ * bridge swaps adjusted_mode back to the panel's native timing for them, see
+ * dsi_manager.c), so the plane rectangles userspace sends are in the virtual
+ * mode's coordinate space while the CRTC runs the native mode.  Map them over:
+ * aspect-fit the virtual desktop into the native CRTC and scale every plane by
+ * that factor, so the image keeps its aspect ratio and the uncovered area of
+ * the panel stays black.  The cursor pipe is a DMA pipe without a scaler, so
+ * only its position is mapped (it stays 1:1 in native pixels).
+ */
+static bool dpu_crtc_state_is_rescaled(const struct drm_crtc_state *crtc_state)
+{
+	return crtc_state->enable &&
+	       (crtc_state->mode.hdisplay != crtc_state->adjusted_mode.hdisplay ||
+		crtc_state->mode.vdisplay != crtc_state->adjusted_mode.vdisplay);
+}
+
+static int dpu_plane_rescale_value(int value, u64 scale, int offset)
+{
+	return offset + (int) (((s64) value * scale) >> 16);
+}
+
+static void dpu_plane_rescale_state(struct drm_plane_state *new_plane_state,
+				    const struct drm_crtc_state *crtc_state)
+{
+	const struct drm_display_mode *mode = &crtc_state->mode;
+	const struct drm_display_mode *native_mode = &crtc_state->adjusted_mode;
+	u64 hscale, vscale, scale;
+	int width, height, off_x, off_y;
+
+	if (!mode->hdisplay || !mode->vdisplay)
+		return;
+
+	hscale = ((u64) native_mode->hdisplay << 16) / mode->hdisplay;
+	vscale = ((u64) native_mode->vdisplay << 16) / mode->vdisplay;
+	scale = min(hscale, vscale);
+
+	width = dpu_plane_rescale_value(mode->hdisplay, scale, 0);
+	height = dpu_plane_rescale_value(mode->vdisplay, scale, 0);
+	off_x = (native_mode->hdisplay - width) / 2;
+	off_y = (native_mode->vdisplay - height) / 2;
+
+	DRM_DEBUG("erhai: %dx%d -> %dx%d (x%d.%03d), offset %d,%d\n",
+		  mode->hdisplay, mode->vdisplay, width, height,
+		  (int) (scale >> 16), (int) ((scale * 1000 >> 16) % 1000),
+		  off_x, off_y);
+
+	new_plane_state->crtc_x =
+		dpu_plane_rescale_value(new_plane_state->crtc_x, scale, off_x);
+	new_plane_state->crtc_y =
+		dpu_plane_rescale_value(new_plane_state->crtc_y, scale, off_y);
+
+	if (new_plane_state->plane->type == DRM_PLANE_TYPE_CURSOR)
+		return;
+
+	new_plane_state->crtc_w =
+		dpu_plane_rescale_value(new_plane_state->crtc_w, scale, 0);
+	new_plane_state->crtc_h =
+		dpu_plane_rescale_value(new_plane_state->crtc_h, scale, 0);
+}
+
+static int dpu_plane_check_plane_state(struct drm_plane_state *new_plane_state,
+				       const struct drm_crtc_state *crtc_state,
+				       int min_scale, int max_scale)
+{
+	struct drm_crtc_state rescaled_crtc_state;
+
+	if (!crtc_state || !dpu_crtc_state_is_rescaled(crtc_state))
+		return drm_atomic_helper_check_plane_state(new_plane_state,
+							   crtc_state,
+							   min_scale, max_scale,
+							   true, true);
+
+	dpu_plane_rescale_state(new_plane_state, crtc_state);
+
+	/*
+	 * Clip against the native mode: the helper clips to crtc_state->mode,
+	 * which is the (smaller) virtual size here.
+	 */
+	rescaled_crtc_state = *crtc_state;
+	rescaled_crtc_state.mode = crtc_state->adjusted_mode;
+
+	return drm_atomic_helper_check_plane_state(new_plane_state,
+						   &rescaled_crtc_state,
+						   min_scale, max_scale,
+						   true, true);
+}
+
 static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 					 struct drm_plane_state *new_plane_state,
 					 const struct drm_crtc_state *crtc_state)
@@ -836,10 +926,8 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
 	min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
 	max_scale = MAX_DOWNSCALE_RATIO << 16;
 
-	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
-						  min_scale,
-						  max_scale,
-						  true, true);
+	ret = dpu_plane_check_plane_state(new_plane_state, crtc_state,
+					  min_scale, max_scale);
 	if (ret) {
 		DPU_DEBUG_PLANE(pdpu, "Check plane state failed (%d)\n", ret);
 		return ret;

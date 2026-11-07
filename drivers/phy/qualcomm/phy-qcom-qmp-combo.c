@@ -5357,6 +5357,24 @@ bool qmp_combo_dp_active(void)
 EXPORT_SYMBOL_GPL(qmp_combo_dp_active);
 
 /*
+ * erhai: how many DP lanes the current Type-C pin assignment actually wires to
+ * the connector.  Pin assignment C (DP only, mux_ctrl=2) gives all four; D/F
+ * (USB3 + DP, mux_ctrl=3) keep two pairs for USB3.  The altmode worker turns
+ * the PMIC mode into qmpphy_mode before HPD reaches the DP driver, so this is
+ * the authoritative answer while a sink's caps are being read.
+ */
+unsigned int qmp_combo_dp_lanes(void)
+{
+	struct qmp_combo *qmp = erhai_qmp_instance;
+
+	if (qmp && READ_ONCE(qmp->qmpphy_mode) == QMPPHY_MODE_DP_ONLY)
+		return 4;
+
+	return 2;
+}
+EXPORT_SYMBOL_GPL(qmp_combo_dp_lanes);
+
+/*
  * erhai: take the shared COM block back for USB3.
  *
  * The typec mux defers the switch back to USB3 while the DP PHY is still

@@ -2336,7 +2336,12 @@
 };
 
 &mdss_dp0_out {
-	data-lanes = <0 1>;
+	/*
+	 * Four lanes: the Type-C pin assignment decides how many are really
+	 * wired (DP-only gives four, USB3+DP gives two), see
+	 * qmp_combo_dp_lanes() and dp_panel_read_dpcd().
+	 */
+	data-lanes = <0 1 2 3>;
 	link-frequencies = /bits/ 64 <1620000000 2700000000 5400000000 8100000000>;
 	remote-endpoint = <&pmic_glink_dp_in>;
 };

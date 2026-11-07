@@ -696,6 +696,20 @@ static void erhai_otg_set_role(struct erhai_otg *otg, enum usb_role role)
 }
 
 extern bool erhai_dwc3_host_active(void);
+extern bool erhai_ucsi_usb_host_role_live(void);
+
+/*
+ * erhai: a UCSI-owned host session is "live" only while UCSI itself reports a
+ * host partner.  dwc3 alone is not enough - a stale ADSP OTG attach can leave
+ * it in host mode with nothing plugged in, and treating that as a live session
+ * suppressed every following detach and wedged the whole Type-C port (charger
+ * and any re-plug invisible until a reboot; mirror-MEMORY-2026-11-07.md
+ * section 21, and the gate-off A/B in section 22).
+ */
+static bool erhai_otg_host_session_live(void)
+{
+	return erhai_dwc3_host_active() && erhai_ucsi_usb_host_role_live();
+}
 
 static bool erhai_detach_gate_enable = true;
 module_param(erhai_detach_gate_enable, bool, 0644);
@@ -712,7 +726,7 @@ static void erhai_otg_vbus_apply(struct erhai_otg *otg, bool on)
 {
 	int ret;
 
-	if (!on && erhai_detach_gate_enable && erhai_dwc3_host_active()) {
+	if (!on && erhai_detach_gate_enable && erhai_otg_host_session_live()) {
 		/*
 		 * Charger-session churn (sc8547a VOOC/BC1.2 renegotiation
 		 * with a DP alt-mode partner) makes the ADSP withdraw
@@ -997,7 +1011,7 @@ static void erhai_otg_rearm_work(struct work_struct *work)
 
 	if (!otg->service_up || erhai_rearm_delay_ms <= 0)
 		return;
-	if (erhai_detach_gate_enable && erhai_dwc3_host_active())
+	if (erhai_detach_gate_enable && erhai_otg_host_session_live())
 		return;	/* host session is back: attach recovered already */
 	if (!otg->armed)
 		erhai_otg_session_sync(true);
@@ -1049,7 +1063,7 @@ static void erhai_otg_rearm_work(struct work_struct *work)
 			mutex_unlock(&otg->vbus_lock);
 			return;
 		}
-		if (!(erhai_detach_gate_enable && erhai_dwc3_host_active())) {
+		if (!(erhai_detach_gate_enable && erhai_otg_host_session_live())) {
 			dev_info(otg->dev,
 				 "otg: rearm: blipping VBUS to surface a missed sink (attempt %d/%d)\n",
 				 otg->blip_retries + 1, erhai_vbus_blip_retries);

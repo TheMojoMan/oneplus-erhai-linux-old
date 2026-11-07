@@ -1961,7 +1961,7 @@ static struct drm_plane *dpu_plane_init_common(struct drm_device *dev,
 	int ret;
 
 	pdpu = drmm_universal_plane_alloc(dev, struct dpu_plane, base,
-				0xff, &dpu_plane_funcs,
+				possible_crtcs, &dpu_plane_funcs,
 				format_list, num_formats,
 				supported_format_modifiers,
 				type, NULL);

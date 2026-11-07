@@ -95,19 +95,39 @@ static enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *drm_brid
 	return msm_dp_display_mode_valid(dp, info, mode);
 }
 
+/*
+ * erhai: not every sink marks a preferred mode.  An EDID 1.3 sink whose
+ * feature byte clears the "preferred timing mode" bit (bit 0) - the Beyond TV
+ * on DP-1 does - leaves every probed mode without DRM_MODE_TYPE_PREFERRED, so
+ * the strict lookup returned NULL and a mirror at 3392x2400 was rejected with
+ * EINVAL.  Mutter kept page-flipping the mirror framebuffer onto the old CRTC
+ * mode, which the DPU drew 1:1 (bottom of the desktop cut off).
+ *
+ * Fall back to the first non-virtual mode, which is the first detailed timing
+ * descriptor of the EDID and therefore the sink's preferred timing by
+ * convention - the same mode mutter picks as preferred.  The virtual mode
+ * itself must never be returned: adjusted_mode would then equal the virtual
+ * mode and the out-of-spec timing would reach the sink unscaled.
+ */
 static const struct drm_display_mode *
 msm_dp_get_sink_mode(struct drm_connector *connector)
 {
 	struct drm_display_mode *mode;
+	const struct drm_display_mode *fallback = NULL;
 
 	if (!connector)
 		return NULL;
 
-	list_for_each_entry(mode, &connector->modes, head)
+	list_for_each_entry(mode, &connector->modes, head) {
+		if (msm_dp_mode_is_virtual(mode))
+			continue;
 		if (mode->type & DRM_MODE_TYPE_PREFERRED)
 			return mode;
+		if (!fallback)
+			fallback = mode;
+	}
 
-	return NULL;
+	return fallback;
 }
 
 /*

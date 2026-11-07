@@ -33,6 +33,94 @@ module_param(psr_enabled, bool, 0);
 MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
 
 /*
+ * erhai: expose the internal panel's native 3392x2400 size on the external DP
+ * output, so a stock compositor has a mode common with DSI-1 and can mirror
+ * without any userspace patch.  The mode is not in the sink EDID; the monitor
+ * is expected to scale it to its own panel (30 Hz keeps the DP/HDMI pixel
+ * clock low enough for the 2-lane USB-C alt-mode links).
+ */
+static const struct drm_display_mode erhai_dp_3392x2400_30 = {
+	.clock = 267168,
+	.hdisplay = 3392,
+	.hsync_start = 3392 + 128,
+	.hsync_end = 3392 + 128 + 32,
+	.htotal = 3392 + 128 + 32 + 128,
+	.vdisplay = 2400,
+	.vsync_start = 2400 + 8,
+	.vsync_end = 2400 + 8 + 4,
+	.vtotal = 2400 + 8 + 4 + 8,
+	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+	.type = DRM_MODE_TYPE_DRIVER,
+};
+
+/* Fallbacks with the same size when the 2-lane alt-mode cannot carry 30 Hz. */
+static const struct drm_display_mode erhai_dp_3392x2400_24 = {
+	.clock = 213734,
+	.hdisplay = 3392,
+	.hsync_start = 3392 + 128,
+	.hsync_end = 3392 + 128 + 32,
+	.htotal = 3680,
+	.vdisplay = 2400,
+	.vsync_start = 2408,
+	.vsync_end = 2412,
+	.vtotal = 2420,
+	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+	.type = DRM_MODE_TYPE_DRIVER,
+};
+
+static const struct drm_display_mode erhai_dp_3392x2400_20 = {
+	.clock = 178112,
+	.hdisplay = 3392,
+	.hsync_start = 3392 + 128,
+	.hsync_end = 3392 + 128 + 32,
+	.htotal = 3680,
+	.vdisplay = 2400,
+	.vsync_start = 2408,
+	.vsync_end = 2412,
+	.vtotal = 2420,
+	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+	.type = DRM_MODE_TYPE_DRIVER,
+};
+
+/*
+ * Default off: a sink whose EDID declares a range limit rejects this timing.
+ * The LG 34" (EDID range 56-75 Hz, max pixel clock 240 MHz) scans it out but
+ * shows its "Out of specification" OSD over the picture, so this route is only
+ * a debug fallback now.  Mirroring without userspace patches is done with the
+ * virtual scaled modes of the internal panel instead
+ * (panel-oneplus-xn242.c + dsi_manager.c + dpu_plane.c).
+ */
+static bool erhai_dp_add_native_mode;
+module_param_named(add_native_panel_mode, erhai_dp_add_native_mode, bool, 0644);
+MODULE_PARM_DESC(add_native_panel_mode,
+		 "add the internal 3392x2400 mode to external DP outputs so mirroring can use the monitor's scaler (debug, usually out of the sink's EDID range)");
+
+static int msm_dp_add_native_panel_mode(struct drm_connector *connector)
+{
+	static const struct drm_display_mode * const modes[] = {
+		&erhai_dp_3392x2400_30,
+		&erhai_dp_3392x2400_24,
+		&erhai_dp_3392x2400_20,
+	};
+	unsigned int i;
+	int count = 0;
+
+	for (i = 0; i < ARRAY_SIZE(modes); i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev, modes[i]);
+		if (!mode)
+			continue;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	return count;
+}
+
+/*
  * In the reverse Type-C orientation a DP-altmode entry makes the USB hub
  * re-attach its upstream link, blacking out the AUX channel for a few hundred
  * ms exactly while we read sink caps / EDID. The hub keeps DP-HPD asserted, so
@@ -827,6 +915,7 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 int msm_dp_display_get_modes(struct msm_dp *dp)
 {
 	struct msm_dp_display_private *msm_dp_display;
+	int count;
 
 	if (!dp) {
 		DRM_ERROR("invalid params\n");
@@ -835,7 +924,12 @@ int msm_dp_display_get_modes(struct msm_dp *dp)
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
 
-	return drm_edid_connector_add_modes(msm_dp_display->panel->connector);
+	count = drm_edid_connector_add_modes(msm_dp_display->panel->connector);
+
+	if (count > 0 && erhai_dp_add_native_mode)
+		count += msm_dp_add_native_panel_mode(msm_dp_display->panel->connector);
+
+	return count;
 }
 
 bool msm_dp_display_check_video_test(struct msm_dp *dp)

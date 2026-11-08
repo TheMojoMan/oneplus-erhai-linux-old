@@ -1483,6 +1483,26 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 	topology = dpu_crtc_get_topology(crtc, dpu_kms, crtc_state);
 	ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
 			     crtc_state->crtc, &topology);
+	if (ret && topology.num_dspp) {
+		/*
+		 * Only LM_0..3 carry a DSPP and the XN242 panel runs the
+		 * 4-LM/4-DSC topology, i.e. a second display can never get a
+		 * DSPP while the panel is active.  Mutter 51 falls back to a
+		 * CTM when a CRTC has no GAMMA_LUT and requests one for every
+		 * display with a colour profile, so a mirrored or extended
+		 * external output fails the whole atomic commit here and
+		 * every output stays black.  Drop the colour transform
+		 * instead of the picture: the CTM in that case is the
+		 * uncalibrated identity ramp, and a real one is simply not
+		 * programmable on this hardware next to the panel.
+		 */
+		DRM_WARN_ONCE("crtc%d: no DSPP left for colour processing, retrying without\n",
+			      crtc->base.id);
+		dpu_rm_release(global_state, crtc);
+		topology.num_dspp = 0;
+		ret = dpu_rm_reserve(&dpu_kms->rm, global_state,
+				     crtc_state->crtc, &topology);
+	}
 	if (ret)
 		return ret;
 

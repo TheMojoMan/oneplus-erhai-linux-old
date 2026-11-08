@@ -3,6 +3,8 @@
  * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/math.h>
+#include <linux/sprintf.h>
 #include <linux/string_choices.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic.h>
@@ -96,6 +98,49 @@ static enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *drm_brid
 }
 
 /*
+ * erhai: the timing the sink is fed while it mirrors the internal panel.
+ *
+ * The virtual 3392x2400 mode exists so stock mutter can mirror at the panel's
+ * native size; what the sink actually receives is a free choice, the DPU
+ * scales the panel framebuffer to it.  <w>x<h> picks a size, an optional
+ * @<hz> a rate of that size (119.88 matches @120); without @<hz> the mode with
+ * the highest refresh of that size is taken.  Empty selects automatically.
+ */
+static char *erhai_dp_mirror_sink_mode;
+module_param_named(mirror_sink_mode, erhai_dp_mirror_sink_mode, charp, 0644);
+MODULE_PARM_DESC(mirror_sink_mode,
+		 "sink timing used when mirroring the internal panel, <w>x<h>[@<hz>] (e.g. 1920x1080@120); empty picks the sink's preferred mode, else the highest refresh it offers");
+
+static const struct drm_display_mode *
+msm_dp_find_named_sink_mode(struct drm_connector *connector, const char *spec)
+{
+	const struct drm_display_mode *mode, *match = NULL;
+	int width, height, refresh = 0, parsed;
+
+	parsed = sscanf(spec, "%dx%d@%d", &width, &height, &refresh);
+	if (parsed < 2)
+		return NULL;
+
+	list_for_each_entry(mode, &connector->modes, head) {
+		if (msm_dp_mode_is_virtual(mode))
+			continue;
+
+		if (mode->hdisplay != width || mode->vdisplay != height)
+			continue;
+
+		if (parsed == 3 &&
+		    abs(drm_mode_vrefresh(mode) - refresh) > 1)
+			continue;
+
+		if (!match ||
+		    drm_mode_vrefresh(mode) > drm_mode_vrefresh(match))
+			match = mode;
+	}
+
+	return match;
+}
+
+/*
  * erhai: not every sink marks a preferred mode.  An EDID 1.3 sink whose
  * feature byte clears the "preferred timing mode" bit (bit 0) - the Beyond TV
  * on DP-1 does - leaves every probed mode without DRM_MODE_TYPE_PREFERRED, so
@@ -103,31 +148,69 @@ static enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *drm_brid
  * EINVAL.  Mutter kept page-flipping the mirror framebuffer onto the old CRTC
  * mode, which the DPU drew 1:1 (bottom of the desktop cut off).
  *
- * Fall back to the first non-virtual mode, which is the first detailed timing
- * descriptor of the EDID and therefore the sink's preferred timing by
- * convention - the same mode mutter picks as preferred.  The virtual mode
- * itself must never be returned: adjusted_mode would then equal the virtual
- * mode and the out-of-spec timing would reach the sink unscaled.
+ * Without a preferred mode, take the highest refresh the sink offers instead
+ * of the first EDID timing: a mirror can only present as fast as its slower
+ * CRTC (and the sink adds its own processing delay on top, worst at 24p), so
+ * on the TV the first timing - 4096x2160@24 - made the mirror lag by several
+ * hundred milliseconds.  1920x1080@120 is the same pixel clock, smooth, and
+ * matches the timing the bootloader already leaves the link at.  Modes within
+ * 1 Hz of each other (59.94/60, 119.88/120) count as the same rate and the
+ * largest of them wins; mirror_sink_mode= overrides the whole choice.
+ *
+ * The virtual mode itself must never be returned: adjusted_mode would then
+ * equal the virtual mode and the out-of-spec timing would reach the sink
+ * unscaled.
  */
 static const struct drm_display_mode *
 msm_dp_get_sink_mode(struct drm_connector *connector)
 {
-	struct drm_display_mode *mode;
-	const struct drm_display_mode *fallback = NULL;
+	const struct drm_display_mode *mode, *best = NULL;
+	int best_refresh = 0;
+	u64 best_area = 0;
 
 	if (!connector)
 		return NULL;
 
-	list_for_each_entry(mode, &connector->modes, head) {
-		if (msm_dp_mode_is_virtual(mode))
-			continue;
-		if (mode->type & DRM_MODE_TYPE_PREFERRED)
-			return mode;
-		if (!fallback)
-			fallback = mode;
+	if (erhai_dp_mirror_sink_mode && *erhai_dp_mirror_sink_mode) {
+		best = msm_dp_find_named_sink_mode(connector,
+						   erhai_dp_mirror_sink_mode);
+		if (best)
+			return best;
+
+		DRM_DEBUG("erhai: no sink mode matches mirror_sink_mode=%s\n",
+			  erhai_dp_mirror_sink_mode);
+		best = NULL;
 	}
 
-	return fallback;
+	list_for_each_entry(mode, &connector->modes, head) {
+		int refresh;
+		u64 area;
+
+		if (msm_dp_mode_is_virtual(mode))
+			continue;
+
+		if (mode->type & DRM_MODE_TYPE_PREFERRED)
+			return mode;
+
+		refresh = drm_mode_vrefresh(mode);
+		area = (u64)mode->hdisplay * mode->vdisplay;
+
+		if (!best) {
+			best = mode;
+			best_refresh = refresh;
+			best_area = area;
+		} else if (refresh > best_refresh + 1) {
+			best = mode;
+			best_refresh = refresh;
+			best_area = area;
+		} else if (refresh + 1 >= best_refresh && area > best_area) {
+			best = mode;
+			best_refresh = refresh;
+			best_area = area;
+		}
+	}
+
+	return best;
 }
 
 /*

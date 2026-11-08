@@ -324,6 +324,16 @@ struct erhai_otg {
 	struct delayed_work rearm_work;
 	int blip_retries;	/* VBUS-blip attempts in the current self-heal chain */
 	bool blip_chain_started;	/* first blip is delayed past teardown/churn */
+	/*
+	 * A detach the gate above suppressed is re-checked here: a real unplug
+	 * leaves the ADSP offline for good, while charger churn keeps the
+	 * partner online.  See erhai_detach_recheck_work().
+	 */
+	struct delayed_work detach_recheck_work;
+	bool detach_pending;
+	unsigned int detach_offline_ticks;
+	unsigned int detach_online_ticks;
+	unsigned int detach_recheck_rounds;
 	bool vbus_on;
 	bool armed;
 
@@ -519,10 +529,14 @@ static int erhai_otg_adsp_soc(struct erhai_otg *otg)
  * 8V SVOOC session at 14:06:06 - vbus 30mV link drop). Any read error keeps
  * the blip enabled (the miss case) - only a positive "online" blocks it.
  */
+static int erhai_otg_connector_online_raw(struct erhai_otg *otg)
+{
+	return erhai_otg_get_op(otg, BC_USB_PROPERTY_GET, BC_USB_ONLINE);
+}
+
 static bool erhai_otg_connector_online(struct erhai_otg *otg)
 {
-	int v = erhai_otg_get_op(otg, BC_USB_PROPERTY_GET, BC_USB_ONLINE);
-	return v > 0;
+	return erhai_otg_connector_online_raw(otg) > 0;
 }
 
 /*
@@ -715,6 +729,29 @@ static bool erhai_detach_gate_enable = true;
 module_param(erhai_detach_gate_enable, bool, 0644);
 MODULE_PARM_DESC(erhai_detach_gate_enable,
 		 "ignore ADSP OTG detach while a UCSI-owned host session is live");
+
+/*
+ * Recheck a SUPPRESSED detach.  The gate above protects a settling hub from
+ * the ADSP's charger-churn DISABLE, but UCSI reports a real unplug only after
+ * a long lag (25-35 s measured 2026-11-08).  Until then the gate suppresses
+ * the one and only detach, the PMIC boost keeps sourcing VBUS, and the ADSP
+ * never runs charger detection again: the port stays in host mode with the
+ * charger invisible (mirror-MEMORY-2026-11-07.md section 21, reproduced
+ * 2026-11-08).  A real unplug also makes the ADSP report USB_ONLINE = 0, while
+ * charger churn keeps a live partner online.  So poll the ADSP connector for a
+ * few ticks and apply the detach (VBUS off, role device) only after the ADSP
+ * has said "offline" for several consecutive reads; a transient churn read
+ * never gets there.  erhai_detach_recheck_ticks=0 disables the recheck.
+ */
+static int erhai_detach_recheck_ms = 2000;
+module_param(erhai_detach_recheck_ms, int, 0644);
+MODULE_PARM_DESC(erhai_detach_recheck_ms,
+		 "poll interval for a suppressed ADSP OTG detach (0=off)");
+
+static int erhai_detach_recheck_ticks = 3;
+module_param(erhai_detach_recheck_ticks, int, 0644);
+MODULE_PARM_DESC(erhai_detach_recheck_ticks,
+		 "consecutive ADSP 'offline' reads before a suppressed detach is applied");
 /*
  * Apply the requested VBUS-boost / data-role state. Idempotent: a repeat ENABLE
  * while a session is up (the ADSP blink) is a no-op that does NOT re-toggle VBUS
@@ -722,11 +759,12 @@ MODULE_PARM_DESC(erhai_detach_gate_enable,
  * enumeration of a hub that is still settling. Runs in process context;
  * vbus_lock serializes the enable and the debounced disable.
  */
-static void erhai_otg_vbus_apply(struct erhai_otg *otg, bool on)
+static void erhai_otg_vbus_apply(struct erhai_otg *otg, bool on, bool force)
 {
 	int ret;
 
-	if (!on && erhai_detach_gate_enable && erhai_otg_host_session_live()) {
+	if (!on && !force && erhai_detach_gate_enable &&
+	    erhai_otg_host_session_live()) {
 		/*
 		 * Charger-session churn (sc8547a VOOC/BC1.2 renegotiation
 		 * with a DP alt-mode partner) makes the ADSP withdraw
@@ -741,10 +779,33 @@ static void erhai_otg_vbus_apply(struct erhai_otg *otg, bool on)
 		 */
 		dev_info(otg->dev,
 			 "otg: detach suppressed: host session live (ucsi owns role)\n");
+		/*
+		 * UCSI can report a real unplug only tens of seconds late; do
+		 * not trust the gate forever.  Re-check the ADSP connector and
+		 * apply the detach ourselves once it stays offline (see
+		 * erhai_detach_recheck_work()).
+		 */
+		if (erhai_detach_recheck_ms > 0 && erhai_detach_recheck_ticks > 0) {
+			otg->detach_pending = true;
+			otg->detach_offline_ticks = 0;
+			otg->detach_online_ticks = 0;
+			otg->detach_recheck_rounds = 0;
+			mod_delayed_work(system_wq, &otg->detach_recheck_work,
+					 msecs_to_jiffies(erhai_detach_recheck_ms));
+			dev_info(otg->dev,
+				 "otg: detach recheck armed (%d ms x %d)\n",
+				 erhai_detach_recheck_ms,
+				 erhai_detach_recheck_ticks);
+		}
 		return;
 	}
 
 	mutex_lock(&otg->vbus_lock);
+	/* Any applied state supersedes a pending suppressed-detach recheck. */
+	otg->detach_pending = false;
+	otg->detach_offline_ticks = 0;
+	otg->detach_online_ticks = 0;
+	cancel_delayed_work(&otg->detach_recheck_work);
 	if (on == otg->vbus_on) {
 		mutex_unlock(&otg->vbus_lock);
 		return;
@@ -1091,11 +1152,76 @@ static void erhai_otg_rearm_work(struct work_struct *work)
 	}
 }
 
+/*
+ * A detach the gate suppressed is only real when the ADSP says so too.
+ * Charger churn keeps the connector online through the DISABLE, while a real
+ * unplug leaves it offline.  Apply the detach after a few consecutive offline
+ * reads even if UCSI still reports its stale host role (it can lag 25-35 s);
+ * if UCSI drops the role first, the detach is real immediately.  Bounded so a
+ * dead ADSP cannot keep a timer running forever.
+ */
+static void erhai_otg_detach_recheck_work(struct work_struct *work)
+{
+	struct erhai_otg *otg = container_of(to_delayed_work(work),
+					     struct erhai_otg,
+					     detach_recheck_work);
+	int online;
+
+	if (!otg->service_up || !otg->detach_pending)
+		return;
+
+	if (!erhai_otg_host_session_live()) {
+		dev_info(otg->dev,
+			 "otg: detach recheck: host session gone, applying the detach\n");
+		goto teardown;
+	}
+
+	online = erhai_otg_connector_online_raw(otg);
+	if (online > 0) {
+		otg->detach_offline_ticks = 0;
+		if (++otg->detach_online_ticks >=
+		    (unsigned int)erhai_detach_recheck_ticks) {
+			dev_info(otg->dev,
+				 "otg: detach recheck: ADSP reports a connector, keeping the session\n");
+			goto keep;
+		}
+	} else if (online == 0) {
+		otg->detach_online_ticks = 0;
+		if (++otg->detach_offline_ticks >=
+		    (unsigned int)erhai_detach_recheck_ticks) {
+			dev_info(otg->dev,
+				 "otg: detach recheck: ADSP offline for %u checks, applying the detach\n",
+				 otg->detach_offline_ticks);
+			goto teardown;
+		}
+	}
+
+	if (++otg->detach_recheck_rounds > 30) {
+		dev_info(otg->dev,
+			 "otg: detach recheck: giving up (ADSP did not answer)\n");
+		goto keep;
+	}
+	schedule_delayed_work(&otg->detach_recheck_work,
+			      msecs_to_jiffies(erhai_detach_recheck_ms));
+	return;
+
+teardown:
+	otg->detach_pending = false;
+	otg->detach_offline_ticks = 0;
+	otg->detach_online_ticks = 0;
+	erhai_otg_vbus_apply(otg, false, true);
+	return;
+keep:
+	otg->detach_pending = false;
+	otg->detach_offline_ticks = 0;
+	otg->detach_online_ticks = 0;
+}
+
 /* BC_OTG_ENABLE: bring the OTG session up (immediate). */
 static void erhai_otg_vbus_work(struct work_struct *work)
 {
 	struct erhai_otg *otg = container_of(work, struct erhai_otg, vbus_work);
-	erhai_otg_vbus_apply(otg, true);
+	erhai_otg_vbus_apply(otg, true, false);
 }
 
 /*
@@ -1109,7 +1235,7 @@ static void erhai_otg_vbus_off_work(struct work_struct *work)
 	struct erhai_otg *otg = container_of(to_delayed_work(work),
 					     struct erhai_otg, vbus_off_work);
 
-	erhai_otg_vbus_apply(otg, false);
+	erhai_otg_vbus_apply(otg, false, false);
 }
 
 static void erhai_otg_callback(const void *data, size_t len, void *priv)
@@ -1590,6 +1716,8 @@ static int erhai_otg_probe(struct auxiliary_device *adev,
 	INIT_WORK(&otg->vbus_work, erhai_otg_vbus_work);
 	INIT_DELAYED_WORK(&otg->vbus_off_work, erhai_otg_vbus_off_work);
 	INIT_DELAYED_WORK(&otg->rearm_work, erhai_otg_rearm_work);
+	INIT_DELAYED_WORK(&otg->detach_recheck_work,
+			  erhai_otg_detach_recheck_work);
 	INIT_DELAYED_WORK(&otg->chglim_work, erhai_otg_chglim_work);
 	otg->chglim_state = -1;
 
@@ -1610,6 +1738,7 @@ static int erhai_otg_probe(struct auxiliary_device *adev,
 		cancel_work_sync(&otg->vbus_work);
 		cancel_delayed_work_sync(&otg->vbus_off_work);
 		cancel_delayed_work_sync(&otg->rearm_work);
+		cancel_delayed_work_sync(&otg->detach_recheck_work);
 		cancel_delayed_work_sync(&otg->chglim_work);
 		debugfs_remove_recursive(otg->debugfs);
 		return PTR_ERR(otg->client);
@@ -1640,6 +1769,7 @@ static void erhai_otg_remove(struct auxiliary_device *adev)
 	cancel_work_sync(&otg->vbus_work);
 	cancel_delayed_work_sync(&otg->vbus_off_work);
 	cancel_delayed_work_sync(&otg->rearm_work);
+	cancel_delayed_work_sync(&otg->detach_recheck_work);
 	cancel_delayed_work_sync(&otg->chglim_work);
 	usb_role_switch_put(otg->role_sw);
 	debugfs_remove_recursive(otg->debugfs);

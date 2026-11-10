@@ -132,9 +132,7 @@ static int a6xx_hfi_wait_for_msg_interrupt(struct a6xx_gmu *gmu, u32 id, u32 seq
 		 * cannot complete while recovery holds gpu->lock, so don't
 		 * wait for one then.
 		 */
-		if (!wait_for_completion_timeout(&a6xx_gpu->base.fault_coredump_done,
-						 msecs_to_jiffies(2000)))
-			break;
+		wait_for_completion(&a6xx_gpu->base.fault_coredump_done);
 	} while (true);
 
 	if (ret) {

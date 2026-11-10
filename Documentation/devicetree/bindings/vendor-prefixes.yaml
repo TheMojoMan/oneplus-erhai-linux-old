@@ -1597,8 +1597,6 @@ patternProperties:
     description: Sophgo Technology Inc.
   "^sourceparts,.*":
     description: Source Parts Inc.
-  "^southchip,.*":
-    description: Southchip Semiconductor Technology (Shanghai) Co., Ltd.
   "^spacemit,.*":
     description: SpacemiT (Hangzhou) Technology Co. Ltd
   "^spansion,.*":
